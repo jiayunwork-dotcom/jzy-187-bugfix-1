@@ -1,0 +1,14 @@
+services:
+  tide:
+    build: .
+    image: tide-harmonic:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - tide-data:/data
+    environment:
+      TIDE_DB_PATH: /data/tide.db
+    restart: unless-stopped
+
+volumes:
+  tide-data:

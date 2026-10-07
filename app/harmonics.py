@@ -48,15 +48,28 @@ FREQUENCIES_CPH: dict[str, float] = {
 # Mean flow has frequency zero and is always part of the model.
 MEAN_NAME = "mean"
 
-# Acceptance priority: constituents are considered in this order, so a rejected
-# weak constituent is "masked" by the most important member of the
-# already-accepted set that it cannot be separated from.  The order puts the
-# strongest constituents first within each species (semidiurnal:
-# M2 > S2 > N2 > K2; diurnal: K1 > O1).
+# Admission priority, strongest / most important first within each species
+# (semidiurnal: M2 > S2 > N2 > K2; diurnal: K1 > O1).
+#
+# The priority list is also the *frequency ownership* order: a constituent is
+# admitted only if it is Rayleigh-separable from the mean and from EVERY
+# constituent ahead of it in this list -- whether or not that higher-priority
+# constituent was itself admitted.  A rejected constituent still "occupies" its
+# frequency slot: a lower-priority candidate that cannot be told apart from it
+# is refused as well, so the rejected constituent's energy can never be
+# published under the lower-priority name.  Blocking is deliberately
+# asymmetric (a rejected weak constituent never blocks a stronger one): the
+# higher-priority member of an unresolvable pair is treated as the owner of the
+# pair's energy, which keeps the classical admission thresholds (e.g. S2 at
+# ~14.8 days) instead of forcing both members to wait for their mutual beat.
 CONSTITUENT_PRIORITY = ["M2", "S2", "N2", "K2", "K1", "O1"]
 
-# Rayleigh separation factor: require record_span >= R / |dw| (in hours).
+# Rayleigh separation factor: require record_span >= R / |df| (in hours).
 RAYLEIGH_FACTOR = 1.0
+
+# Tolerance (hours) on the span comparison, so a span sitting exactly on a
+# tabulated threshold counts as satisfying it.
+_SPAN_TOL = 1e-9
 
 _TWO_PI = 2.0 * math.pi
 
@@ -103,46 +116,92 @@ def _wrap_inclination(angle: float) -> float:
 def select_constituents(record_hours: float) -> tuple[
     list[SelectedConstituent], list[RejectedConstituent]
 ]:
-    """Greedily accept constituents that the observed record can resolve.
+    """Select the constituents resolvable by a record of ``record_hours``.
 
-    Rule (classical Rayleigh criterion): candidate c is accepted iff for
-    every frequency already in the model, including the mean at f = 0,
-        record_hours >= RAYLEIGH_FACTOR / |f_c - f_j|
-    with f in cycles per hour.  Against the mean this demands at least one
-    constituent cycle; against another tidal constituent it demands one full
-    beat period, at which point the cosine/sine basis pairs are (nearly)
-    orthogonal.  When rejected, the closest in-model frequency is reported as
-    the "masking" constituent, along with the span that is still missing.
+    Classical Rayleigh criterion, f in cycles per hour, factor R = 1:
+
+        record_hours >= R / |f_c - f_j|
+
+    A candidate c is admitted iff it is separable from
+
+      1. the mean (f = 0) -- one full constituent cycle must have elapsed,
+         otherwise its cos/sin columns are indistinguishable from the
+         constant column; and
+      2. every constituent j that precedes c in ``CONSTITUENT_PRIORITY``,
+         **including ones that were themselves rejected**.
+
+    The second point is the fix for the "borrowed name" failure of a plain
+    greedy pass that only compares against the admitted set: a rejected
+    constituent keeps occupying its frequency, so a near-by lower-priority
+    candidate cannot slip in and absorb the rejected constituent's energy
+    (short pure-M2 record published as S2; S2 energy published as K2 once S2
+    itself is blocked by M2).  Blocking is one-way -- a candidate is never
+    tested against constituents behind it -- so the stronger member of an
+    unresolved pair, not the weaker, holds the slot.
+
+    Because every comparison is a fixed function of the span, the admitted set
+    is monotone in ``record_hours``: once a constituent enters it is never
+    pushed out again as the record grows.
+
+    For a rejected candidate the reported ``masked_by`` / ``required_hours``
+    are the gate that is currently failing with the SMALLEST required span
+    (the closest blocker, what an analyst would quote first):
+
+      * if the span does not yet cover one full cycle of the candidate, the
+        mean is reported;
+      * otherwise the higher-priority constituent whose beat period is the
+        nearest unmet threshold.
+
+    ``missing_hours`` is relative to that gate; a longer gate may exist and
+    become the binding one later (the caller derives the deficit from the
+    reported required span and the current span).
     """
     accepted: list[SelectedConstituent] = [
         SelectedConstituent(MEAN_NAME, 0.0)
     ]
     rejected: list[RejectedConstituent] = []
 
+    # Candidates are tested against every HIGHER-priority constituent, whether
+    # admitted or not; this list is therefore the prefix of the priority list,
+    # not the accepted list.
+    higher: list[str] = []
+
     for name in CONSTITUENT_PRIORITY:
         w = FREQUENCIES_RPH[name]
         f_cycles = FREQUENCIES_CPH[name]
-        # The constituent must be separable from *every* frequency already in
-        # the model, including the mean (frequency 0): with no positive span a
-        # tidal column is indistinguishable from the constant column.  Record
-        # the closest neighbour that blocks it (what an analyst would quote as
-        # the interfering constituent).
-        blockers: list[tuple[str, float]] = []
-        for sel in accepted:
-            dw = abs(f_cycles - (0.0 if sel.name == MEAN_NAME else FREQUENCIES_CPH[sel.name]))
-            required = RAYLEIGH_FACTOR / dw
-            if record_hours + 1e-9 < required:
-                blockers.append((sel.name, required))
 
-        if not blockers:
+        # Gate 0: separation from the constant column = one constituent cycle.
+        period = RAYLEIGH_FACTOR / f_cycles
+        short_of_one_cycle = record_hours + _SPAN_TOL < period
+
+        # Gates 1..k: one full beat period against each higher-priority
+        # constituent, admitted or rejected.
+        gates: list[tuple[str, float]] = []
+        for other in higher:
+            required = RAYLEIGH_FACTOR / abs(f_cycles - FREQUENCIES_CPH[other])
+            if record_hours + _SPAN_TOL < required:
+                gates.append((other, required))
+
+        if not short_of_one_cycle and not gates:
             accepted.append(SelectedConstituent(name, w))
         else:
-            def _freq_of(label: str) -> float:
-                return 0.0 if label == MEAN_NAME else FREQUENCIES_CPH[label]
+            if short_of_one_cycle:
+                # The record does not even contain one cycle of the candidate:
+                # the constant column is the meaningful blocker, regardless of
+                # beat gates with numerically similar thresholds.
+                blocker_name, required = MEAN_NAME, period
+            else:
+                # Nearest failing beat gate = the smallest still-unmet required
+                # span.  Ties (numerically identical beat periods) resolve by
+                # priority order, which is the order of ``higher``.
+                order = {n: i for i, n in enumerate(higher)}
 
-            blocker_name, required = min(
-                blockers, key=lambda item: abs(f_cycles - _freq_of(item[0]))
-            )
+                def _gate_key(gate: tuple[str, float]) -> tuple[float, int]:
+                    label, req = gate
+                    return (req, order[label])
+
+                blocker_name, required = min(gates, key=_gate_key)
+
             rejected.append(
                 RejectedConstituent(
                     name=name,
@@ -152,6 +211,8 @@ def select_constituents(record_hours: float) -> tuple[
                     current_hours=record_hours,
                 )
             )
+
+        higher.append(name)
 
     return accepted, rejected
 

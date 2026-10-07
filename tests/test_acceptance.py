@@ -143,7 +143,7 @@ def test_short_record_s2_k2_not_together(client, station_factory):
     result = resp.json()
     names = {c["name"] for c in result["constituents"]}
     assert not ({"S2", "K2"} <= names)
-    assert "M2" in names  # M2 vs mean: only 0.69h needed
+    assert "M2" in names  # M2 vs mean: one full cycle (12.42 h) suffices
     assert result["record"]["span_hours"] == SHORT_HOURS
 
 

@@ -48,11 +48,12 @@ FREQUENCIES_CPH: dict[str, float] = {
 # Mean flow has frequency zero and is always part of the model.
 MEAN_NAME = "mean"
 
-# Acceptance priority: constituents are considered in this order, so a rejected
-# weak constituent is "masked" by the most important member of the
-# already-accepted set that it cannot be separated from.  The order puts the
-# strongest constituents first within each species (semidiurnal:
-# M2 > S2 > N2 > K2; diurnal: K1 > O1).
+# Acceptance priority: constituents are considered in this order and each
+# candidate must be separable from every *higher-priority* candidate (and the
+# mean), whether or not those were themselves accepted -- a rejected
+# constituent still occupies its slot and masks its weaker neighbours.  The
+# order puts the strongest constituents first within each species
+# (semidiurnal: M2 > S2 > N2 > K2; diurnal: K1 > O1).
 CONSTITUENT_PRIORITY = ["M2", "S2", "N2", "K2", "K1", "O1"]
 
 # Rayleigh separation factor: require record_span >= R / |dw| (in hours).
@@ -72,7 +73,7 @@ class RejectedConstituent:
     name: str
     frequency: float
     masked_by: str
-    required_hours: float  # record span needed to separate from masked_by
+    required_hours: float  # record span at which the constituent would be admitted
     current_hours: float
 
 
@@ -103,52 +104,71 @@ def _wrap_inclination(angle: float) -> float:
 def select_constituents(record_hours: float) -> tuple[
     list[SelectedConstituent], list[RejectedConstituent]
 ]:
-    """Greedily accept constituents that the observed record can resolve.
+    """Accept the constituents that the observed record can resolve.
 
-    Rule (classical Rayleigh criterion): candidate c is accepted iff for
-    every frequency already in the model, including the mean at f = 0,
+    Rule (classical Rayleigh criterion): candidate c is accepted iff for the
+    mean (f = 0) and for *every higher-priority candidate* j -- accepted or
+    not --
         record_hours >= RAYLEIGH_FACTOR / |f_c - f_j|
     with f in cycles per hour.  Against the mean this demands at least one
     constituent cycle; against another tidal constituent it demands one full
     beat period, at which point the cosine/sine basis pairs are (nearly)
-    orthogonal.  When rejected, the closest in-model frequency is reported as
-    the "masking" constituent, along with the span that is still missing.
+    orthogonal.
+
+    Rejected candidates keep occupying their slot: comparing only against the
+    accepted set would let a weak neighbour soak up the energy of a rejected
+    one (e.g. S2 impersonating M2 on a 12 h record, or K2 impersonating S2 on
+    a 14 d record -- see docs/ALGORITHM.md).  Because every constraint is a
+    fixed frequency pair, each constituent has a constant admission threshold
+    and acceptance is monotone in the record span: once admitted, a
+    constituent can never drop out of a longer record.
+
+    Rejection report: if the record does not even cover one full cycle, the
+    constituent is masked by the mean (the constant column is the foremost
+    ambiguity); otherwise it is masked by the higher-priority constituent
+    with the largest unsatisfied beat requirement (the binding constraint).
+    ``required_hours`` is the admission threshold itself -- the maximum over
+    all of the candidate's separation constraints -- so ``missing_hours`` is
+    exactly how much more record is needed for acceptance.
     """
     accepted: list[SelectedConstituent] = [
         SelectedConstituent(MEAN_NAME, 0.0)
     ]
     rejected: list[RejectedConstituent] = []
 
-    for name in CONSTITUENT_PRIORITY:
+    for i, name in enumerate(CONSTITUENT_PRIORITY):
         w = FREQUENCIES_RPH[name]
         f_cycles = FREQUENCIES_CPH[name]
-        # The constituent must be separable from *every* frequency already in
-        # the model, including the mean (frequency 0): with no positive span a
-        # tidal column is indistinguishable from the constant column.  Record
-        # the closest neighbour that blocks it (what an analyst would quote as
-        # the interfering constituent).
-        blockers: list[tuple[str, float]] = []
-        for sel in accepted:
-            dw = abs(f_cycles - (0.0 if sel.name == MEAN_NAME else FREQUENCIES_CPH[sel.name]))
-            required = RAYLEIGH_FACTOR / dw
-            if record_hours + 1e-9 < required:
-                blockers.append((sel.name, required))
 
-        if not blockers:
+        # One full cycle against the constant column.
+        period = RAYLEIGH_FACTOR / f_cycles
+        threshold = period
+        mean_blocks = record_hours + 1e-9 < period
+
+        # One full beat against every higher-priority candidate, admitted or
+        # not.  Lower-priority candidates never block: the stronger
+        # constituent claims the shared energy first.
+        blockers: list[tuple[str, float]] = []
+        for other in CONSTITUENT_PRIORITY[:i]:
+            dw = abs(f_cycles - FREQUENCIES_CPH[other])
+            required = RAYLEIGH_FACTOR / dw
+            threshold = max(threshold, required)
+            if record_hours + 1e-9 < required:
+                blockers.append((other, required))
+
+        if not mean_blocks and not blockers:
             accepted.append(SelectedConstituent(name, w))
         else:
-            def _freq_of(label: str) -> float:
-                return 0.0 if label == MEAN_NAME else FREQUENCIES_CPH[label]
-
-            blocker_name, required = min(
-                blockers, key=lambda item: abs(f_cycles - _freq_of(item[0]))
-            )
+            if mean_blocks:
+                masked_by = MEAN_NAME
+            else:
+                masked_by = max(blockers, key=lambda item: item[1])[0]
             rejected.append(
                 RejectedConstituent(
                     name=name,
                     frequency=w,
-                    masked_by=blocker_name,
-                    required_hours=required,
+                    masked_by=masked_by,
+                    required_hours=threshold,
                     current_hours=record_hours,
                 )
             )
